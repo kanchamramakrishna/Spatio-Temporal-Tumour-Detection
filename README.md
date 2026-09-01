@@ -202,7 +202,7 @@ The application layer exposes the trained system through a dedicated inference i
 
 ---
 
-# 📐 Mathematical View
+#  Mathematical View
 
 The problem can be represented as learning a function over a sequence of observations:
 
@@ -386,7 +386,7 @@ The architecture is intentionally modular so that the underlying representation-
 
 ---
 
-# ⚡ Installation
+#  Installation
 
 Clone the repository:
 
