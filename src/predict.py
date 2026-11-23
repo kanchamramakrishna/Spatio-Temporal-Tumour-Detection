@@ -1,151 +1,155 @@
+import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import os
 from model import UNet3D
 
 # --- CONFIGURATION ---
 MODEL_PATH = "tumor_model.pth"
 DATA_DIR = r"E:\EDI\tumor_growth_project\data\processed"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_INPUT_TIMEPOINTS = 2
+IN_CHANNELS = NUM_INPUT_TIMEPOINTS * 2  # scan + mask per timepoint
+OUT_CHANNELS = 1  # predicted future CT scan
+
+
+def _to_dhw(arr):
+    a = np.asarray(arr)
+    if a.ndim == 4:
+        a = a.squeeze()
+    if a.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got shape {a.shape}")
+    # Saved as (H, W, D); model/training use (D, H, W)
+    return np.transpose(a, (2, 0, 1))
+
 
 def load_model():
-    """Re-initializes the U-Net and loads trained weights."""
     print(f"Loading model from {MODEL_PATH}...")
-    model = UNet3D(n_channels=2, n_classes=1).to(DEVICE)
+    model = UNet3D(n_channels=IN_CHANNELS, n_classes=OUT_CHANNELS).to(DEVICE)
     try:
         model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-        model.eval() # Set to evaluation mode (freezes weights)
+        model.eval()
         print("✅ Model loaded successfully.")
         return model
     except FileNotFoundError:
-        print("❌ Model file not found. Run 'train.py' first.")
-        exit()
+        print("❌ Model file not found. Run 'train.py' after retraining for future-scan prediction.")
+        raise
+
 
 def get_patient_sample(patient_id, tp_idx=0):
     """
-    Loads processed .npy files for a specific patient.
-    Returns: input_tensor, ground_truth_mask, raw_scan (for plotting)
+    Loads two consecutive input timepoints and the future target scan.
+    Returns: input_tensor (1,C,D,H,W), future_scan (D,H,W), input_scans_dhw list, input_tps, target_tp
     """
     p_dir = os.path.join(DATA_DIR, patient_id)
     if not os.path.exists(p_dir):
         raise FileNotFoundError(f"Patient {patient_id} not found in processed data.")
-    
-    timepoints = sorted([d for d in os.listdir(p_dir) if d.startswith("Timepoint_")], 
-                       key=lambda x: int(x.split('_')[-1]))
-    
-    if len(timepoints) < 2:
-        raise ValueError("Patient needs at least 2 timepoints for prediction.")
 
-    # Pair: T1 (Input) -> T2 (Target)
-    tp_in = timepoints[tp_idx]
-    tp_out = timepoints[tp_idx + 1]
+    timepoints = sorted(
+        [d for d in os.listdir(p_dir) if d.startswith("Timepoint_") and os.path.isdir(os.path.join(p_dir, d))],
+        key=lambda x: int(x.split("_")[-1]),
+    )
 
-    print(f"Predicting: {tp_in} -> {tp_out}")
+    needed = tp_idx + NUM_INPUT_TIMEPOINTS + 1
+    if len(timepoints) < needed:
+        raise ValueError(
+            f"Patient needs at least {NUM_INPUT_TIMEPOINTS + 1} timepoints for two-input future prediction. "
+            f"Found {len(timepoints)}."
+        )
 
-    # Load NPY
-    scan = np.load(os.path.join(p_dir, tp_in, "scan.npy"))
-    mask_curr = np.load(os.path.join(p_dir, tp_in, "mask.npy"))
-    mask_next = np.load(os.path.join(p_dir, tp_out, "mask.npy"))
+    input_tps = timepoints[tp_idx:tp_idx + NUM_INPUT_TIMEPOINTS]
+    target_tp = timepoints[tp_idx + NUM_INPUT_TIMEPOINTS]
+    print(f"Predicting future scan: {input_tps[0]} + {input_tps[1]} -> {target_tp}")
 
-    # Prepare Tensor (Add Batch Dim: 1, Channels, D, H, W)
-    t_scan = torch.from_numpy(scan).float().unsqueeze(0)
-    t_mask = torch.from_numpy(mask_curr).float().unsqueeze(0)
-    
-    # Input Channel 0: Scan, Channel 1: Mask
-    input_tensor = torch.cat([t_scan, t_mask], dim=0).unsqueeze(0) # Shape: (1, 2, D, H, W)
-    
-    return input_tensor, mask_next, scan
+    channels = []
+    input_scans_dhw = []
+    for tp in input_tps:
+        scan = _to_dhw(np.load(os.path.join(p_dir, tp, "scan.npy")))
+        mask = _to_dhw(np.load(os.path.join(p_dir, tp, "mask.npy")))
+        input_scans_dhw.append(scan)
+        channels.extend([
+            torch.from_numpy(scan).float(),
+            torch.from_numpy(mask).float(),
+        ])
 
-def calculate_dice(pred, target):
-    """Calculates accuracy (0.0 to 1.0)"""
-    smooth = 1e-5
-    intersection = (pred * target).sum()
-    return (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+    future_scan = _to_dhw(np.load(os.path.join(p_dir, target_tp, "scan.npy")))
+    input_tensor = torch.stack(channels, dim=0).unsqueeze(0)
+    return input_tensor, future_scan, input_scans_dhw, input_tps, target_tp
 
-def visualize_prediction(scan, input_mask, true_mask, pred_mask, patient_id, score):
-    """
-    Plots a 4-panel comparison of the middle slice.
-    """
-    # Pick middle slice of the depth
-    d_idx = scan.shape[2] // 2 
-    
-    scan_slice = np.rot90(scan[:, :, d_idx])
-    in_slice = np.rot90(input_mask[:, :, d_idx])
-    true_slice = np.rot90(true_mask[:, :, d_idx])
-    pred_slice = np.rot90(pred_mask[:, :, d_idx])
+
+def calculate_metrics(pred, target):
+    pred = np.asarray(pred, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+    mae = float(np.mean(np.abs(pred - target)))
+    mse = float(np.mean((pred - target) ** 2))
+    psnr = float(20 * np.log10(1.0 / np.sqrt(mse + 1e-8)))
+    return {"mae": mae, "mse": mse, "psnr": psnr}
+
+
+def visualize_prediction(input_scans_dhw, true_scan, pred_scan, patient_id, input_tps, target_tp, metrics):
+    d_idx = true_scan.shape[0] // 2
+
+    panels = [
+        (np.rot90(input_scans_dhw[0][d_idx]), f"Input Scan ({input_tps[0]})"),
+        (np.rot90(input_scans_dhw[1][d_idx]), f"Input Scan ({input_tps[1]})"),
+        (np.rot90(true_scan[d_idx]), f"Actual Future Scan ({target_tp})"),
+        (np.rot90(pred_scan[d_idx]), f"Predicted Future Scan (MAE {metrics['mae']:.4f})"),
+    ]
 
     fig, ax = plt.subplots(1, 4, figsize=(20, 5))
-    
-    # 1. Input MRI
-    ax[0].imshow(scan_slice, cmap="gray")
-    ax[0].set_title("Input MRI (T1)")
-    ax[0].axis('off')
+    for i, (img, title) in enumerate(panels):
+        ax[i].imshow(img, cmap="gray", vmin=0, vmax=1)
+        ax[i].set_title(title)
+        ax[i].axis("off")
 
-    # 2. Input Tumor
-    ax[1].imshow(scan_slice, cmap="gray", alpha=0.6)
-    ax[1].imshow(np.ma.masked_where(in_slice==0, in_slice), cmap="Blues", alpha=0.7)
-    ax[1].set_title("Starting Tumor (Input)")
-    ax[1].axis('off')
-
-    # 3. Ground Truth Future
-    ax[2].imshow(scan_slice, cmap="gray", alpha=0.6)
-    ax[2].imshow(np.ma.masked_where(true_slice==0, true_slice), cmap="Greens", alpha=0.7)
-    ax[2].set_title("Real Future Tumor (Target)")
-    ax[2].axis('off')
-
-    # 4. AI Prediction
-    ax[3].imshow(scan_slice, cmap="gray", alpha=0.6)
-    ax[3].imshow(np.ma.masked_where(pred_slice==0, pred_slice), cmap="Reds", alpha=0.7)
-    ax[3].set_title(f"AI Prediction (Dice: {score:.3f})")
-    ax[3].axis('off')
-
-    plt.suptitle(f"Tumor Growth Prediction: {patient_id}", fontsize=16)
+    plt.suptitle(f"Future CT Scan Prediction: {patient_id}", fontsize=16)
     plt.tight_layout()
     plt.show()
 
+
 if __name__ == "__main__":
-    # 1. Load Model
     model = load_model()
 
-    # 2. Select Patient
-    patients = sorted([d for d in os.listdir(DATA_DIR) if d.startswith("PatientID_")])
+    patients = sorted([d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))])
     print("\nAvailable Patients:")
-    for i, p in enumerate(patients[:10]): # Show first 10
+    for i, p in enumerate(patients[:20]):
         print(f" [{i}] {p}")
-    
+
     try:
         choice = int(input("Select patient index: "))
         patient_id = patients[choice]
-        
-        # 3. Get Data
-        input_tensor, true_mask, raw_scan = get_patient_sample(patient_id)
+
+        p_dir = os.path.join(DATA_DIR, patient_id)
+        timepoints = sorted(
+            [d for d in os.listdir(p_dir) if d.startswith("Timepoint_")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        max_start = len(timepoints) - (NUM_INPUT_TIMEPOINTS + 1)
+        if max_start < 0:
+            raise ValueError("Selected patient does not have enough timepoints (need >= 3).")
+
+        tp_idx = 0
+        if max_start > 0:
+            raw = input(f"Select input pair start index [0-{max_start}] (default 0): ").strip()
+            if raw:
+                tp_idx = int(raw)
+        if tp_idx < 0 or tp_idx > max_start:
+            raise ValueError(f"Input pair start index must be between 0 and {max_start}.")
+
+        input_tensor, true_scan, input_scans_dhw, input_tps, target_tp = get_patient_sample(patient_id, tp_idx=tp_idx)
         input_tensor = input_tensor.to(DEVICE)
 
-        # 4. Run Inference
-        print("Running Neural Network...")
+        print("Running neural network...")
         with torch.no_grad():
-            output = model(input_tensor)
-            
-            # Apply Sigmoid (Logits -> Probability 0..1)
-            probs = torch.sigmoid(output)
-            
-            # Apply Threshold (Probability -> Binary Mask 0 or 1)
-            pred_mask = (probs > 0.5).float().cpu().numpy()[0, 0] # Remove Batch/Channel dims
+            pred_scan = model(input_tensor).clamp(0.0, 1.0).cpu().numpy()[0, 0]
 
-        # 5. Calculate Score
-        # Ensure true_mask is simple array
-        if len(true_mask.shape) > 3: true_mask = true_mask[0] 
-        
-        dice_score = calculate_dice(pred_mask, true_mask)
-        print(f"\n✅ Prediction Complete.")
-        print(f"Dice Similarity Coefficient: {dice_score:.4f}")
-        
-        # 6. Visualize
-        # For visualization, we need the Input Mask from the tensor
-        input_mask_display = input_tensor.cpu().numpy()[0, 1] 
-        
-        visualize_prediction(raw_scan, input_mask_display, true_mask, pred_mask, patient_id, dice_score)
+        metrics = calculate_metrics(pred_scan, true_scan)
+        print("\n✅ Prediction complete.")
+        print(f"MAE:  {metrics['mae']:.6f}")
+        print(f"MSE:  {metrics['mse']:.6f}")
+        print(f"PSNR: {metrics['psnr']:.2f} dB")
+
+        visualize_prediction(input_scans_dhw, true_scan, pred_scan, patient_id, input_tps, target_tp, metrics)
 
     except Exception as e:
         print(f"Error: {e}")

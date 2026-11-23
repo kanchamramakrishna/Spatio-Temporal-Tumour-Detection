@@ -120,8 +120,8 @@ class UNet3D(nn.Module):
         return logits
 
 if __name__ == "__main__":
-    # Test
-    model = UNet3D(n_channels=2, n_classes=1)
-    dummy = torch.randn(1, 2, 64, 128, 128)
+    # Example: two input timepoints (scan+mask each) -> predicted future scan
+    model = UNet3D(n_channels=4, n_classes=1)
+    dummy = torch.randn(1, 4, 32, 64, 64)
     out = model(dummy)
     print(f"Shape Check: {out.shape}")

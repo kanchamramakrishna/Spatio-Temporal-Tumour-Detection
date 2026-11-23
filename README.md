@@ -334,39 +334,34 @@ This makes longitudinal modeling particularly valuable for identifying changes t
 Spatio-Temporal-Tumour-Detection/
 │
 ├── src/
+│   ├── analysis.py
+│   ├── app.py
+│   ├── app_sample.py
+│   ├── dataset_loader.py
+│   ├── detector.py
+│   ├── evaluate.py
+│   ├── gradcam.py
+│   ├── gradcam_plus.py
 │   ├── main.py
-│   └── app.py
-│
-├── notebooks/
-│   └── experimentation/
-│
-├── data/
-│   └── dataset/
-│
-├── outputs/
-│   └── experiments/
-│
+│   ├── masking.py
+│   ├── model.py
+│   ├── predict.py
+│   ├── preprocess.py
+│   ├── preprocess_detector.py
+│   ├── train.py
+│   ├── train_detector.py
+│   ├── viewer_volume.py
+│   └── volume_analysis.py
+├── workflow_stpa.png
 ├── requirements.txt
 └── README.md
 ```
 
 ### `src/`
 
-Core implementation containing the training, prediction, analysis, and application pipeline.
+Python source for data preparation, model training and inference, longitudinal analysis, visualization, and the Streamlit interface. See the [source code guide](src/README.md) for a file-by-file description, workflow, and expected data layout.
 
-### `notebooks/`
-
-Experimental environment for exploratory analysis, visualization, model development, and evaluation.
-
-### `data/`
-
-Expected location for the imaging dataset.
-
-The dataset is intentionally not included in the repository.
-
-### `outputs/`
-
-Reserved for generated predictions, experiment artifacts, logs, and model outputs.
+The imaging datasets and trained model weights are not included in the repository. Scripts currently configure data and model paths in their source; update those paths to match your local setup before running them.
 
 ---
 
@@ -402,35 +397,37 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Place the required dataset inside:
-
-```text
-data/
-```
+The dataset is not included in the repository. Set the raw, processed, and model paths in the relevant scripts to match your local dataset and output locations before running the workflows. See the [source code guide](src/README.md) for the expected folder layout.
 
 ---
 
 #  Training
 
-Run the training pipeline:
+The project has two separate training tracks. Run commands from the repository root after configuring the data paths in the scripts.
 
 ```bash
-python src/main.py
+# Longitudinal future CT/MRI scan prediction (two input timepoints -> future scan)
+python src/preprocess.py
+python src/train.py
+
+# Tumor-presence classification
+python src/preprocess_detector.py
+python src/train_detector.py
 ```
 
-The training pipeline is responsible for loading the prepared dataset, constructing the learning pipeline, training the model, and generating experiment outputs.
+`train.py` expects patients with at least 3 consecutive processed timepoints so it can form `(T1, T2) -> T3` samples (input: scan+mask for each of the two prior timepoints, target: future scan). The first track writes `tumor_model.pth`; the second writes `detector_model.pth`. Existing mask-prediction checkpoints are not compatible after this change and must be retrained. `main.py` is an interactive patient growth tracker, not a training script.
 
 ---
 
 #  Inference & Application
 
-Launch the application interface:
+Launch the Streamlit interface:
 
 ```bash
-python src/app.py
+streamlit run src/app.py
 ```
 
-The application provides an interface for interacting with the trained model and performing tumour analysis.
+The interface reads processed data and whichever trained model weights are available. For a single longitudinal future-scan prediction from two input timepoints, run `python src/predict.py`; to score all available `(T1, T2) -> T3` samples and write an MAE/MSE/PSNR CSV report, run `python src/evaluate.py`.
 
 ---
 
